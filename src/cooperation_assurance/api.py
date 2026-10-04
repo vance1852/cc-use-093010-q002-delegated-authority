@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from .errors import ServiceError, ValidationFailed
+from .errors import Forbidden, ServiceError, ValidationFailed
 from .service import AssuranceService
 from .storage import connect
 
@@ -33,6 +33,17 @@ class JsonApplication:
         actor = headers.get("x-actor-id", "").strip()
         if not actor:
             raise ValidationFailed("缺少 X-Actor-Id")
+        return actor
+
+    def _staff(self, headers: Mapping[str, str]) -> str:
+        """秘书处或审计人员专用的只读解释接口。"""
+
+        actor = self._actor(headers)
+        row = self.service.connection.execute(
+            "SELECT role,active FROM users WHERE user_id=?", (actor,)
+        ).fetchone()
+        if row is None or not row["active"] or row["role"] not in {"operator", "auditor"}:
+            raise Forbidden("只有秘书处和审计人员可以查询授权与资格解释")
         return actor
 
     @staticmethod
@@ -89,7 +100,8 @@ class JsonApplication:
                 if not key:
                     raise ValidationFailed("缺少 Idempotency-Key")
                 result = self.service.import_observations(
-                    self._actor(normalized_headers), parts[1], key, payload.get("observations", [])
+                    self._actor(normalized_headers), parts[1], key, payload.get("observations", []),
+                    principal_id=payload.get("principal_id"),
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "seal":
@@ -133,6 +145,97 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            # -- 代表授权与回避治理 ---------------------------------------
+            governance = self.service.governance
+            if method == "POST" and path == "/grants":
+                result = governance.propose_grant(
+                    self._actor(normalized_headers), payload["grant_id"], payload["principal_id"],
+                    payload["representative_id"], payload["action"],
+                    payload["valid_from"], payload["valid_until"], payload["idempotency_key"],
+                    program_id=payload.get("program_id"),
+                    evidence_revision_id=payload.get("evidence_revision_id"),
+                    delegable=bool(payload.get("delegable", False)),
+                    max_chain_depth=int(payload.get("max_chain_depth", 0)),
+                    reason=payload.get("reason", ""),
+                )
+                return Response(201, result)
+            if method == "GET" and len(parts) == 2 and parts[0] == "grants":
+                actor = self._actor(normalized_headers)
+                view = governance.grant_view(parts[1])
+                row = self.service.connection.execute(
+                    "SELECT role,active FROM users WHERE user_id=?", (actor,)
+                ).fetchone()
+                if row is None or not row["active"]:
+                    raise Forbidden("用户不存在或已停用")
+                if actor != view["representative_id"] and row["role"] not in {"operator", "auditor"}:
+                    raise Forbidden("只有秘书处、审计人员或代表人本人可以查看授权")
+                return Response(200, view)
+            if method == "POST" and len(parts) == 3 and parts[0] == "grants" and parts[2] in {
+                "accept", "reject", "suspend", "resume", "withdraw"
+            }:
+                action = {
+                    "accept": governance.accept_grant,
+                    "reject": governance.reject_grant,
+                    "suspend": governance.suspend_grant,
+                    "resume": governance.resume_grant,
+                    "withdraw": governance.withdraw_grant,
+                }[parts[2]]
+                result = action(
+                    self._actor(normalized_headers), parts[1], payload["idempotency_key"],
+                    payload.get("reason", ""),
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "grants" and parts[2] == "delegate":
+                result = governance.delegate_grant(
+                    self._actor(normalized_headers), parts[1], payload["child_grant_id"],
+                    payload["representative_id"], payload["valid_from"], payload["valid_until"],
+                    payload["idempotency_key"], payload.get("reason", ""),
+                )
+                return Response(201, result)
+            if method == "POST" and path == "/interests":
+                result = governance.disclose_interest(
+                    self._actor(normalized_headers), payload["user_id"], payload["related_party_id"],
+                    payload["relation_type"], payload["idempotency_key"], payload.get("detail", ""),
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "interests" and parts[2] == "clear":
+                result = governance.clear_interest(
+                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
+                )
+                return Response(200, result)
+            if method == "POST" and path == "/seats":
+                result = governance.assign_review(
+                    self._actor(normalized_headers), payload["batch_id"], payload["stage"],
+                    payload["assignee_id"], payload["principal_id"],
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "seats" and parts[2] == "revoke":
+                result = governance.revoke_seat(
+                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
+                )
+                return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "seats":
+                self._staff(normalized_headers)
+                return Response(200, {"seats": governance.seat_history(parts[1])})
+            if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "eligibility":
+                self._staff(normalized_headers)
+                query = parse_qs(urlparse(target).query)
+                if "stage" not in query:
+                    raise ValidationFailed("缺少 stage 查询参数")
+                return Response(200, governance.eligible_representatives(
+                    parts[1], query["stage"][0], query.get("at", [None])[0]
+                ))
+            if method == "GET" and path == "/explain":
+                self._staff(normalized_headers)
+                query = parse_qs(urlparse(target).query)
+                required = ("user_id", "action")
+                if any(key not in query for key in required):
+                    raise ValidationFailed("explain 需要 user_id 与 action 查询参数")
+                return Response(200, governance.explain(
+                    query["user_id"][0], query["action"][0], query.get("at", [None])[0],
+                    program_id=query.get("program_id", [None])[0],
+                    evidence_revision_id=query.get("evidence_revision_id", [None])[0],
+                ))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

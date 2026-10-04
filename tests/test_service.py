@@ -39,6 +39,20 @@ class ServiceTests(unittest.TestCase):
         self.service.publish_protocol("stat", self.protocol)
         self.service.create_batch("operator", "batch-a", "demo-cooperation-v1", 1, "evidence_revision-a")
         self.service.start_batch("operator", "batch-a", 1)
+        governance = self.service.governance
+        window = ("2026-01-01T00:00:00Z", "2026-12-31T23:59:59Z")
+        governance.propose_grant(
+            "operator", "grant-stat", "投资方A", "stat", "exclusion.review",
+            window[0], window[1], "k-grant-stat",
+            program_id="program-a", evidence_revision_id="evidence_revision-a",
+        )
+        governance.accept_grant("stat", "grant-stat", "k-accept-stat")
+        governance.propose_grant(
+            "operator", "grant-approver", "候选服务商B", "approver", "decision.write",
+            window[0], window[1], "k-grant-approver",
+            program_id="program-a", evidence_revision_id="evidence_revision-a",
+        )
+        governance.accept_grant("approver", "grant-approver", "k-accept-approver")
 
     def tearDown(self) -> None:
         self.connection.close()
@@ -49,10 +63,14 @@ class ServiceTests(unittest.TestCase):
         self.service.seal_batch("stat", "batch-a", 2)
         job = self.service.claim_job("worker", 30)
         analysis = self.service.complete_job("worker", job["job_id"], "stat")
+        self.service.governance.assign_review(
+            "operator", "batch-a", "admission_decision", "approver", "候选服务商B"
+        )
         self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
         report = self.service.report("auditor", "batch-a")
         self.assertEqual(report["batch"]["state"], "decided")
         self.assertEqual(report["analysis"]["result"]["conclusion"], "pass")
+        self.assertEqual(report["decision"]["authority"]["grant_id"], "grant-approver")
 
     def test_idempotent_replay_and_conflict(self) -> None:
         first = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
@@ -86,6 +104,9 @@ class ServiceTests(unittest.TestCase):
             "SELECT observation_id FROM observations ORDER BY observation_id LIMIT 1"
         ).fetchone()[0]
         requested = self.service.request_exclusion("operator", observation_id, "现场记录失效")
+        self.service.governance.assign_review(
+            "operator", "batch-a", "exclusion_review", "stat", "投资方A"
+        )
         reviewed = self.service.review_exclusion("stat", requested["exclusion_id"], True, "证据充分")
         self.assertEqual(reviewed["status"], "approved")
         revoked = self.service.revoke_exclusion("operator", requested["exclusion_id"], "已找回原始记录")

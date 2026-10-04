@@ -12,6 +12,7 @@ from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import Observation, Protocol, ValidationError
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .governance import AuthorizationGovernance
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
@@ -34,6 +35,7 @@ class AssuranceService:
         self.connection = connection
         self.clock = clock or SystemClock()
         initialize(connection)
+        self.governance = AuthorizationGovernance(connection, self.clock)
 
     def _now(self) -> str:
         return isoformat(self.clock.now())
@@ -206,6 +208,7 @@ class AssuranceService:
         batch_id: str,
         idempotency_key: str,
         raw_rows: Iterable[Mapping[str, Any]],
+        principal_id: str | None = None,
     ) -> dict[str, Any]:
         self._require(actor_id, "observation.import")
         rows = tuple(raw_rows)
@@ -220,6 +223,17 @@ class AssuranceService:
         if batch["state"] != "running":
             raise InvalidState("只有运行中的批次可以导入测点")
         protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
+        # 代表受托提交材料时，必须依据当时有效且绑定该材料版本的授权。
+        mandate: dict[str, Any] | None = None
+        if principal_id is not None:
+            mandate = self.governance.require_effective_grant(
+                actor_id, "observation.import", principal_id,
+                program_id=self.connection.execute(
+                    "SELECT program_id FROM evidence_revisions WHERE evidence_revision_id=?",
+                    (batch["evidence_revision_id"],),
+                ).fetchone()["program_id"],
+                evidence_revision_id=batch["evidence_revision_id"],
+            )
         parsed: list[Observation] = []
         for raw in rows:
             try:
@@ -255,7 +269,10 @@ class AssuranceService:
                     "INSERT INTO idempotency_keys(scope,key,request_sha256,response_json,created_at) VALUES(?,?,?,?,?)",
                     (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
                 )
-                self._audit("batch", batch_id, "observations.imported", actor_id, response)
+                self._audit("batch", batch_id, "observations.imported", actor_id, response | {
+                    "on_behalf_of_principal": None if mandate is None else mandate["principal_id"],
+                    "grant_id": None if mandate is None else mandate["grant_id"],
+                })
         except sqlite3.IntegrityError as exc:
             raise Conflict("来源行重复或幂等键并发冲突") from exc
         return response
@@ -285,7 +302,9 @@ class AssuranceService:
     ) -> dict[str, Any]:
         self._require(actor_id, "exclusion.review")
         row = self.connection.execute(
-            "SELECT * FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
+            "SELECT e.*,o.batch_id FROM exclusion_requests e "
+            "JOIN observations o ON o.observation_id=e.observation_id WHERE e.exclusion_id=?",
+            (exclusion_id,),
         ).fetchone()
         if row is None:
             raise NotFound("排除申请不存在")
@@ -293,14 +312,23 @@ class AssuranceService:
             raise InvalidState("排除申请已经处理")
         if row["requested_by"] == actor_id:
             raise Forbidden("申请人不能复核自己的排除申请")
+        # 必须持有按当时有效授权分派的在执评审席位；授权失效或出现利益冲突时
+        # require_seat 直接拒绝，未决事项由秘书处重新分派给替代人员。
+        seat = self.governance.require_seat(actor_id, row["batch_id"], "exclusion_review")
         status = "approved" if approve else "rejected"
+        # 复核席位覆盖整个排除复核阶段，可连续复核多份申请；
+        # 批次封存时才关闭（见 seal_batch），中途冲突则由治理层撤回并重新分派。
         with transaction(self.connection, immediate=True):
             self.connection.execute(
-                "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
+                "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=?,"
+                "reviewed_with_grant_id=?,reviewed_principal_id=? "
                 "WHERE exclusion_id=? AND status='pending'",
-                (status, actor_id, self._now(), note, exclusion_id),
+                (status, actor_id, self._now(), note, seat["grant_id"], seat["principal_id"], exclusion_id),
             )
-            self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
+            self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {
+                "note": note, "grant_id": seat["grant_id"], "principal_id": seat["principal_id"],
+                "assignment_id": seat["assignment_id"],
+            })
         return {"exclusion_id": exclusion_id, "status": status}
 
     def revoke_exclusion(self, actor_id: str, exclusion_id: int, reason: str) -> dict[str, Any]:
@@ -358,6 +386,12 @@ class AssuranceService:
                 "INSERT INTO analysis_jobs(batch_id,batch_revision,state,available_at,created_at,updated_at) "
                 "VALUES(?,?, 'queued', ?,?,?)",
                 (batch_id, new_revision, now, now, now),
+            )
+            # 封存后不再产生排除事项，未使用的在执复核席位随之结束。
+            self.connection.execute(
+                "UPDATE review_assignments SET state='completed',completed_at=? "
+                "WHERE batch_id=? AND stage='exclusion_review' AND state='active'",
+                (now, batch_id),
             )
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
@@ -495,20 +529,26 @@ class AssuranceService:
         batch = self.get_batch(batch_id)
         if batch["state"] != "analyzed" or batch["revision"] != analysis_row["batch_revision"]:
             raise InvalidState("分析不是批次当前可审批版本")
+        # 按参与评审时的有效授权与利益关系计算资格：必须持有在执准入席位。
+        seat = self.governance.require_seat(actor_id, batch_id, "admission_decision")
         try:
             with transaction(self.connection, immediate=True):
                 cursor = self.connection.execute(
-                    "INSERT INTO decisions(batch_id,analysis_id,decision,reason,decided_by,decided_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (batch_id, analysis_id, decision, reason, actor_id, self._now()),
+                    "INSERT INTO decisions(batch_id,analysis_id,decision,reason,decided_by,decided_at,"
+                    "decided_with_grant_id,decided_principal_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (batch_id, analysis_id, decision, reason, actor_id, self._now(),
+                     seat["grant_id"], seat["principal_id"]),
                 )
                 self.connection.execute("UPDATE batches SET state='decided' WHERE batch_id=?", (batch_id,))
+                self.governance.complete_seat_sql(seat["assignment_id"])
                 self._audit(
                     "batch",
                     batch_id,
                     "decision.recorded",
                     actor_id,
-                    {"decision_id": cursor.lastrowid, "analysis_id": analysis_id, "decision": decision},
+                    {"decision_id": cursor.lastrowid, "analysis_id": analysis_id, "decision": decision,
+                     "grant_id": seat["grant_id"], "principal_id": seat["principal_id"],
+                     "assignment_id": seat["assignment_id"]},
                 )
         except sqlite3.IntegrityError as exc:
             raise Conflict("该分析版本已经形成决定") from exc
@@ -554,7 +594,14 @@ class AssuranceService:
                 "created_by": analysis_row["created_by"],
                 "result": json.loads(analysis_row["result_json"]),
             },
-            "decision": None if decision_row is None else dict(decision_row),
+            "decision": None if decision_row is None else {
+                **dict(decision_row),
+                "authority": None if decision_row["decided_with_grant_id"] is None else {
+                    "grant_id": decision_row["decided_with_grant_id"],
+                    "principal_id": decision_row["decided_principal_id"],
+                },
+            },
+            "seats": self.governance.seat_history(batch_id),
             "exclusions": [dict(row) for row in exclusions],
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

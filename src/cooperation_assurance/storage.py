@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -101,7 +101,9 @@ CREATE TABLE IF NOT EXISTS exclusion_requests (
     requested_at TEXT NOT NULL,
     reviewed_by TEXT REFERENCES users(user_id),
     reviewed_at TEXT,
-    review_note TEXT
+    review_note TEXT,
+    reviewed_with_grant_id TEXT REFERENCES authorization_grants(grant_id),
+    reviewed_principal_id TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_observation
@@ -145,6 +147,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     reason TEXT NOT NULL,
     decided_by TEXT NOT NULL REFERENCES users(user_id),
     decided_at TEXT NOT NULL,
+    decided_with_grant_id TEXT REFERENCES authorization_grants(grant_id),
+    decided_principal_id TEXT,
     UNIQUE (batch_id, analysis_id)
 );
 
@@ -157,12 +161,115 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- 代表授权：绑定委托主体、代表人、业务动作、材料版本、生效区间与可转委托条件。
+-- 授权本身是一行不可变的委托关系；其生命周期状态全部记录在 grant_events 中，
+-- 任何接受、拒绝、转授权、暂停、恢复、撤回都只追加事实，从不覆盖。
+CREATE TABLE IF NOT EXISTS authorization_grants (
+    grant_id TEXT PRIMARY KEY,
+    principal_id TEXT NOT NULL,
+    representative_id TEXT NOT NULL REFERENCES users(user_id),
+    action TEXT NOT NULL,
+    program_id TEXT REFERENCES cooperation_programs(program_id),
+    evidence_revision_id TEXT REFERENCES evidence_revisions(evidence_revision_id),
+    scope_json TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    delegable INTEGER NOT NULL DEFAULT 0 CHECK (delegable IN (0, 1)),
+    max_chain_depth INTEGER NOT NULL DEFAULT 0 CHECK (max_chain_depth >= 0),
+    parent_grant_id TEXT REFERENCES authorization_grants(grant_id),
+    chain_depth INTEGER NOT NULL DEFAULT 0 CHECK (chain_depth >= 0),
+    status TEXT NOT NULL
+        CHECK (status IN ('proposed', 'accepted', 'rejected', 'suspended', 'withdrawn')),
+    idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    CHECK (valid_until > valid_from),
+    CHECK (parent_grant_id IS NOT NULL OR chain_depth = 0)
+);
+
+-- 同一委托主体对同一代表人、同一业务动作、同一材料版本只允许存在一条未终结的授权；
+-- 并发或重复回调时第二个事务命中此索引，绝不会产生两份有效席位。
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_grant_per_mandate
+ON authorization_grants(principal_id, representative_id, action,
+                        COALESCE(program_id, ''), COALESCE(evidence_revision_id, ''))
+WHERE status IN ('proposed', 'accepted', 'suspended');
+
+CREATE UNIQUE INDEX IF NOT EXISTS grant_idempotency_unique
+ON authorization_grants(idempotency_key);
+
+-- 授权生命周期事实流，只增不改不删。
+CREATE TABLE IF NOT EXISTS grant_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_id TEXT NOT NULL REFERENCES authorization_grants(grant_id),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'proposed', 'accepted', 'rejected', 'delegated', 'suspended', 'resumed', 'withdrawn'
+    )),
+    actor_id TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL,
+    effective_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 重复回调携带同一幂等键时命中此索引，不会写入第二条事实。
+CREATE UNIQUE INDEX IF NOT EXISTS grant_event_idempotency_unique
+ON grant_events(idempotency_key);
+
+CREATE INDEX IF NOT EXISTS grant_events_by_grant
+ON grant_events(grant_id, event_id);
+
+-- 利益关系申报与解除，同样是只增事实；active 由事件序列决定，
+-- 但保留部分唯一索引，确保同一人与同一相关方不会并存两条生效申报。
+CREATE TABLE IF NOT EXISTS interest_disclosures (
+    disclosure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    related_party_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    declared_at TEXT NOT NULL,
+    cleared_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_disclosure
+ON interest_disclosures(user_id, related_party_id)
+WHERE active = 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS disclosure_idempotency_unique
+ON interest_disclosures(idempotency_key);
+
+-- 评审/审批席位：每个批次每个阶段至多一份有效席位，席位必须绑定当时有效的授权。
+-- 授权失效或利益冲突出现时席位关闭（state='revoked'），未决事项据此重新分派；
+-- 已完成（'completed'）的席位永久保留，合法决定不被追溯。
+CREATE TABLE IF NOT EXISTS review_assignments (
+    assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    stage TEXT NOT NULL CHECK (stage IN ('exclusion_review', 'admission_decision')),
+    seat_seq INTEGER NOT NULL CHECK (seat_seq >= 1),
+    assignee_id TEXT NOT NULL REFERENCES users(user_id),
+    grant_id TEXT NOT NULL REFERENCES authorization_grants(grant_id),
+    principal_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'completed', 'revoked')),
+    revoke_reason TEXT NOT NULL DEFAULT '',
+    predecessor_assignment_id INTEGER REFERENCES review_assignments(assignment_id),
+    assigned_at TEXT NOT NULL,
+    completed_at TEXT,
+    revoked_at TEXT,
+    UNIQUE (batch_id, stage, seat_seq)
+);
+
+-- 数据库层保证同一阶段只有一份在执席位，并发分派也不会产生两份有效席位。
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_seat_per_stage
+ON review_assignments(batch_id, stage)
+WHERE state = 'active';
 """
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "cooperation_programs", "evidence_revisions", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
+    "authorization_grants", "grant_events", "interest_disclosures", "review_assignments",
 })
 
 
